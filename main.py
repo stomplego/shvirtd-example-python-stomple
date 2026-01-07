@@ -3,7 +3,7 @@ import os
 from contextlib import contextmanager, asynccontextmanager
 
 import mysql.connector
-from fastapi import FastAPI, Request, Depends, Header
+from fastapi import FastAPI, Request, Depends, Header, HTTPException
 from typing import Optional
 
 
@@ -18,22 +18,10 @@ db_name = os.environ.get('DB_NAME', 'example')
 async def lifespan(app: FastAPI):
     # Код, который выполнится перед запуском приложения
     print("Приложение запускается...")
-    try:
-        with get_db_connection() as db:
-            cursor = db.cursor()
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS {db_name}.requests (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                request_date DATETIME,
-                request_ip VARCHAR(255)
-            )
-            """
-            cursor.execute(create_table_query)
-            db.commit()
-            print("Соединение с БД установлено и таблица 'requests' готова к работе.")
-            cursor.close()
-    except mysql.connector.Error as err:
-        print(f"Ошибка при подключении к БД или создании таблицы: {err}")
+    if ensure_table_exists():
+        print("Соединение с БД установлено и таблица 'requests' готова к работе.")
+    else:
+        print("БД недоступна при старте. Таблица будет создана при первом запросе.")
     
     yield
     
@@ -67,6 +55,28 @@ def get_db_connection():
             db.close()
 
 
+# --- 2.1. Функция создания таблицы ---
+def ensure_table_exists():
+    """Создает таблицу requests если она не существует"""
+    try:
+        with get_db_connection() as db:
+            cursor = db.cursor()
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {db_name}.requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                request_date DATETIME,
+                request_ip VARCHAR(255)
+            )
+            """
+            cursor.execute(create_table_query)
+            db.commit()
+            cursor.close()
+            return True
+    except mysql.connector.Error as err:
+        print(f"Ошибка при создании таблицы: {err}")
+        return False
+
+
 # --- 3. Зависимость для получения IP ---
 def get_client_ip(x_real_ip: Optional[str] = Header(None)):
     return x_real_ip
@@ -89,7 +99,14 @@ def index(request: Request, ip_address: Optional[str] = Depends(get_client_ip)):
             db.commit()
             cursor.close()
     except mysql.connector.Error as err:
-        return {"error": f"Ошибка при работе с базой данных: {err}"}
+        ensure_table_exists()
+        with get_db_connection() as db:
+            cursor = db.cursor()
+            query = "INSERT INTO requests (request_date, request_ip) VALUES (%s, %s)"
+            values = (current_time, final_ip)
+            cursor.execute(query, values)
+            db.commit()
+            cursor.close()
 
     # Подсказка для студентов при неправильном обращении
     if final_ip is None:
@@ -139,7 +156,27 @@ def get_requests():
                 "records": result
             }
     except mysql.connector.Error as err:
-        return {"error": f"Ошибка при чтении из базы данных: {err}"}
+        ensure_table_exists()
+        with get_db_connection() as db:
+            cursor = db.cursor()
+            query = "SELECT id, request_date, request_ip FROM requests ORDER BY id DESC LIMIT 50"
+            cursor.execute(query)
+            records = cursor.fetchall()
+            cursor.close()
+            
+            # Преобразуем записи в читабельный формат
+            result = []
+            for record in records:
+                result.append({
+                    "id": record[0],
+                    "request_date": record[1].strftime("%Y-%m-%d %H:%M:%S") if record[1] else None,
+                    "request_ip": record[2]
+                })
+            
+            return {
+                "total_records": len(result),
+                "records": result
+            }
 
 
 # --- 7. Запуск приложения ---
